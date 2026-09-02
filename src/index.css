@@ -1,0 +1,127 @@
+@import "tailwindcss";
+
+@theme {
+  /* ——— VÉRA palette ——— */
+  --color-ink: #0d0c0a;          /* near-black, warm */
+  --color-coal: #161310;         /* lifted black for dark sections */
+  --color-ivory: #f2ecdf;        /* warm ivory */
+  --color-sand: #e6ddcb;         /* soft beige */
+  --color-stone: #9b927e;        /* stone grey */
+  --color-smoke: #6e6656;        /* deep stone for light-bg body text */
+  --color-champagne: #c2a264;    /* muted gold accent */
+  --color-champagne-soft: #d8c08f;
+
+  --font-display: "Italiana", "Times New Roman", serif;
+  --font-body: "Manrope", ui-sans-serif, system-ui, sans-serif;
+
+  --ease-cinematic: cubic-bezier(0.65, 0.01, 0.05, 1);
+}
+
+html {
+  background: var(--color-ink);
+  scrollbar-width: thin;
+  scrollbar-color: rgba(194, 162, 100, 0.35) transparent;
+}
+
+html.lenis,
+html.lenis body {
+  height: auto;
+}
+.lenis.lenis-smooth {
+  scroll-behavior: auto !important;
+}
+.lenis.lenis-stopped {
+  overflow: hidden;
+}
+
+body {
+  background: var(--color-ink);
+  color: var(--color-ivory);
+  font-family: var(--font-body);
+  font-weight: 300;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: clip;
+}
+
+::selection {
+  background: var(--color-champagne);
+  color: var(--color-ink);
+}
+
+::-webkit-scrollbar {
+  width: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(194, 162, 100, 0.3);
+}
+
+/* ——— typography helpers ——— */
+.font-display {
+  font-family: var(--font-display);
+  font-weight: 400;
+  letter-spacing: 0.015em;
+}
+
+.eyebrow {
+  font-family: var(--font-body);
+  font-weight: 500;
+  font-size: 0.625rem;
+  letter-spacing: 0.42em;
+  text-transform: uppercase;
+}
+
+@media (min-width: 768px) {
+  .eyebrow {
+    font-size: 0.6875rem;
+  }
+}
+
+/* ——— تم إزالة الظلال السوداء (Vignette) نهائياً لتصبح الفيديوهات ناصعة البياض والجمال ——— */
+.vignette, .vignette-soft {
+  background: transparent !important;
+  display: none !important;
+}
+
+/* ——— تم تعطيل النغمشة والتشويش النقطي (Film Grain) تماماً لجميع الصفحات ——— */
+.grain-overlay {
+  display: none !important;
+  opacity: 0 !important;
+  animation: none !important;
+}
+
+@keyframes cue {
+  0% { transform: translateY(-110%); }
+  55% { transform: translateY(220%); }
+  100% { transform: translateY(220%); }
+}
+
+/* ——— link underline micro-interaction ——— */
+.u-link {
+  position: relative;
+}
+.u-link::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  bottom: -4px;
+  height: 1px;
+  width: 100%;
+  background: currentColor;
+  transform: scaleX(0);
+  transform-origin: right center;
+  transition: transform 0.55s var(--ease-cinematic);
+}
+.u-link:hover::after {
+  transform: scaleX(1);
+  transform-origin: left center;
+}
+
+/* ——— تم إزالة الخلفية السوداء التلقائية من تحت الفيديوهات ——— */
+video {
+  object-fit: cover;
+  background: transparent !important;
+}
