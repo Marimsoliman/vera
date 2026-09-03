@@ -1,39 +1,43 @@
+// src/data/scenes.ts
 export interface CinematicSceneData {
-  id: "city" | "building" | "interior";
-  src: string;
-  poster: string;
+  id: string;
   index: string;
   title: string;
   caption: string;
-  preload: "auto" | "none";
+  folder: string;
+  frameCount: number;
 }
+
+export const FRAME_COUNT = 176;
 
 export const SCENES: CinematicSceneData[] = [
   {
-    id: "city",
+    id: "scene-1",
     index: "01",
-    title: "THE CITY",
-    caption: "Rising above the skyline, redefining modern luxury.",
-    src: "/videos/Scene_01.mp4", // تم تعديلها إلى src بدلاً من videoSrc
-    poster: "",
-    preload: "auto",
+    title: "ARCHITECTURAL VISION",
+    caption: "Sculpted geometry meets natural light in an elevated living sanctuary.",
+    folder: "/frames/scene1",
+    frameCount: FRAME_COUNT,
   },
   {
-    id: "building",
+    id: "scene-2",
     index: "02",
-    title: "THE BUILDING",
-    caption: "Architectural precision sculpted for eternity.",
-    src: "/videos/Scene_02.mp4", // أو اتركي مسار تجريبي إن لم يكن جاهزاً
-    poster: "",
-    preload: "none",
+    title: "TIMELESS TEXTURES",
+    caption: "Raw travertine, brushed metals, and bespoke organic materials.",
+    folder: "/frames/scene2",
+    frameCount: FRAME_COUNT,
   },
   {
-    id: "interior",
+    id: "scene-3",
     index: "03",
-    title: "THE INTERIOR",
-    caption: "Where elevated living meets bespoke craftsmanship.",
-    src: "/videos/Scene_03.mp4",
-    poster: "",
-    preload: "none",
+    title: "ELEVATED HORIZONS",
+    caption: "Panoramic vistas designed to blur the boundary between inside and out.",
+    folder: "/frames/scene3",
+    frameCount: FRAME_COUNT,
   },
 ];
+
+// Helper: بناء رابط الفريم
+export const getFramePath = (folder: string, frameNumber: number): string => {
+  return `${folder}/frame_${String(frameNumber).padStart(4, "0")}.webp`;
+};

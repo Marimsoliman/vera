@@ -1,170 +1,448 @@
 // src/components/hero/CinematicHero.tsx
-import { useLayoutEffect, useRef } from "react";
+import { useLayoutEffect, useRef, useEffect, useState } from "react";
 import { ArrowDown } from "lucide-react";
 import { gsap, ScrollTrigger } from "../../lib/gsap";
 import { prefersReducedMotion, scrollToTarget } from "../../lib/scroll";
-import { SCENES } from "../../data/scenes";
-import CinematicScene from "./CinematicScene";
+import { SCENES, FRAME_COUNT, getFramePath } from "../../data/scenes";
 import ArrowLink from "../ui/ArrowLink";
+
+/* ═══════════════════════════════════════════════════════════════
+   إعدادات الأداء والذاكرة
+   ═══════════════════════════════════════════════════════════════ */
+const CANVAS_ASPECT = 1366 / 768;
+const DPR_CAP = 1.75;              // حد أقصى لدقة الكانفاس (لتخفيف الحمل على الموبايل)
+const INITIAL_PRELOAD = 30;        // عدد الفريمات الأولى التي تُحمّل فوراً للمشهد الأول
+const CHUNK_SIZE = 20;             // حجم مجموعة التحميل التدريجي
+const KEEP_IN_MEMORY_BUFFER = 45;  // عدد الفريمات المحتفظ بها حول الفريم الحالي
+
+/* ═══════════════════════════════════════════════════════════════
+   نوع كائن تخزين الصور
+   ═══════════════════════════════════════════════════════════════ */
+interface SceneImageCache {
+  images: (HTMLImageElement | null)[];
+  loaded: boolean[];
+  loading: boolean[];
+}
 
 export default function CinematicHero() {
   const rootRef = useRef<HTMLElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [firstFrameReady, setFirstFrameReady] = useState(false);
   const reduced = prefersReducedMotion();
 
+  // كاش الصور لكل مشهد (خارج React state لتفادي re-renders)
+  const cacheRef = useRef<SceneImageCache[]>(
+    SCENES.map(() => ({
+      images: new Array(FRAME_COUNT).fill(null),
+      loaded: new Array(FRAME_COUNT).fill(false),
+      loading: new Array(FRAME_COUNT).fill(false),
+    }))
+  );
+
+  // متغيرات التتبع الحالية للرسم
+  const currentStateRef = useRef({
+    sceneIndex: 0,
+    frameIndex: 0,
+    lastDrawnScene: -1,
+    lastDrawnFrame: -1,
+  });
+
+  /* ═════════════════════════════════════════════════════════════
+     1) تحميل صورة واحدة مع معالجة الأخطاء
+     ═════════════════════════════════════════════════════════════ */
+  const loadFrame = (sceneIdx: number, frameIdx: number): Promise<HTMLImageElement | null> => {
+    return new Promise((resolve) => {
+      const cache = cacheRef.current[sceneIdx];
+      if (!cache || cache.loaded[frameIdx] || cache.loading[frameIdx]) {
+        resolve(cache?.images[frameIdx] ?? null);
+        return;
+      }
+
+      cache.loading[frameIdx] = true;
+      const img = new Image();
+      img.decoding = "async";
+      img.src = getFramePath(SCENES[sceneIdx].folder, frameIdx + 1);
+
+      img.onload = () => {
+        cache.images[frameIdx] = img;
+        cache.loaded[frameIdx] = true;
+        cache.loading[frameIdx] = false;
+        resolve(img);
+      };
+
+      img.onerror = () => {
+        cache.loading[frameIdx] = false;
+        // في حالة الخطأ: لا نكسر الأنيميشن، فقط نتخطى هذا الفريم
+        console.warn(`[CinematicHero] Failed to load: ${img.src}`);
+        resolve(null);
+      };
+    });
+  };
+
+  /* ═════════════════════════════════════════════════════════════
+     2) تحميل مجموعة (Chunk) من الفريمات لمشهد معين
+     ═════════════════════════════════════════════════════════════ */
+  const loadChunk = async (sceneIdx: number, startFrame: number, size: number) => {
+    const promises: Promise<HTMLImageElement | null>[] = [];
+    const end = Math.min(startFrame + size, FRAME_COUNT);
+    for (let i = startFrame; i < end; i++) {
+      promises.push(loadFrame(sceneIdx, i));
+    }
+    await Promise.all(promises);
+  };
+
+  /* ═════════════════════════════════════════════════════════════
+     3) تنظيف الذاكرة: تفريغ الفريمات البعيدة عن الفريم الحالي
+     ═════════════════════════════════════════════════════════════ */
+  const pruneMemory = (activeSceneIdx: number, activeFrameIdx: number) => {
+    cacheRef.current.forEach((cache, sIdx) => {
+      // لا نمس المشهد النشط الحالي
+      if (sIdx === activeSceneIdx) {
+        for (let i = 0; i < FRAME_COUNT; i++) {
+          const distance = Math.abs(i - activeFrameIdx);
+          if (distance > KEEP_IN_MEMORY_BUFFER && cache.loaded[i]) {
+            cache.images[i] = null;
+            cache.loaded[i] = false;
+          }
+        }
+      } else {
+        // المشاهد الأخرى: احتفظ فقط بأول عدد قليل من الفريمات كـ "warm-up"
+        for (let i = 5; i < FRAME_COUNT; i++) {
+          if (cache.loaded[i]) {
+            cache.images[i] = null;
+            cache.loaded[i] = false;
+          }
+        }
+      }
+    });
+  };
+
+  /* ═════════════════════════════════════════════════════════════
+     4) رسم الفريم على الكانفاس (Cover Aspect)
+     ═════════════════════════════════════════════════════════════ */
+  const drawFrame = (img: HTMLImageElement) => {
+    const canvas = canvasRef.current;
+    if (!canvas || !img.complete || img.naturalWidth === 0) return;
+
+    const ctx = canvas.getContext("2d", { alpha: false });
+    if (!ctx) return;
+
+    const cw = canvas.width;
+    const ch = canvas.height;
+    const iw = img.naturalWidth;
+    const ih = img.naturalHeight;
+
+    const scale = Math.max(cw / iw, ch / ih);
+    const dw = iw * scale;
+    const dh = ih * scale;
+    const dx = (cw - dw) / 2;
+    const dy = (ch - dh) / 2;
+
+    ctx.drawImage(img, dx, dy, dw, dh);
+  };
+
+  /* ═════════════════════════════════════════════════════════════
+     5) رسم مع Fallback ذكي عند عدم توفر الفريم
+     ═════════════════════════════════════════════════════════════ */
+  const renderCurrentFrame = () => {
+    const state = currentStateRef.current;
+    const { sceneIndex, frameIndex } = state;
+
+    // Skip إذا كنا رسمنا نفس الفريم بالفعل
+    if (state.lastDrawnScene === sceneIndex && state.lastDrawnFrame === frameIndex) {
+      return;
+    }
+
+    const cache = cacheRef.current[sceneIndex];
+    const targetImg = cache.images[frameIndex];
+
+    if (targetImg && cache.loaded[frameIndex]) {
+      drawFrame(targetImg);
+      state.lastDrawnScene = sceneIndex;
+      state.lastDrawnFrame = frameIndex;
+    } else {
+      // Fallback: ابحث عن أقرب فريم محمّل لتفادي الشاشة السوداء
+      let nearestImg: HTMLImageElement | null = null;
+      for (let offset = 1; offset < FRAME_COUNT; offset++) {
+        const before = cache.images[frameIndex - offset];
+        const after = cache.images[frameIndex + offset];
+        if (before && cache.loaded[frameIndex - offset]) { nearestImg = before; break; }
+        if (after && cache.loaded[frameIndex + offset]) { nearestImg = after; break; }
+      }
+      if (nearestImg) drawFrame(nearestImg);
+
+      // اطلب تحميل الفريم المفقود لاستخدامه لاحقاً
+      loadFrame(sceneIndex, frameIndex).then((img) => {
+        if (img && currentStateRef.current.frameIndex === frameIndex &&
+            currentStateRef.current.sceneIndex === sceneIndex) {
+          drawFrame(img);
+          state.lastDrawnScene = sceneIndex;
+          state.lastDrawnFrame = frameIndex;
+        }
+      });
+    }
+  };
+
+  /* ═════════════════════════════════════════════════════════════
+     6) ضبط أبعاد الكانفاس مع Aspect Ratio + DPR Cap
+     ═════════════════════════════════════════════════════════════ */
+  const resizeCanvas = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const dpr = Math.min(window.devicePixelRatio || 1, DPR_CAP);
+    const rect = canvas.getBoundingClientRect();
+
+    // نحافظ على aspect ratio 1366:768 عبر cover
+    const width = Math.round(rect.width * dpr);
+    const height = Math.round(rect.height * dpr);
+
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+
+      // إعادة رسم الفريم الحالي فوراً بعد تغيير الحجم
+      currentStateRef.current.lastDrawnFrame = -1;
+      renderCurrentFrame();
+    }
+  };
+
+  /* ═════════════════════════════════════════════════════════════
+     7) التحميل المبدئي — يبدأ فور تحميل الصفحة
+     ═════════════════════════════════════════════════════════════ */
+  useEffect(() => {
+    let mounted = true;
+
+    (async () => {
+      // Preload أول فريم فقط لعرضه فوراً (No flash / No black frame)
+      const firstImg = await loadFrame(0, 0);
+      if (!mounted) return;
+
+      resizeCanvas();
+      if (firstImg) {
+        drawFrame(firstImg);
+        currentStateRef.current.lastDrawnScene = 0;
+        currentStateRef.current.lastDrawnFrame = 0;
+      }
+      setFirstFrameReady(true);
+
+      // ثم حمل باقي الفريمات الأولى بشكل تدريجي (في الخلفية)
+      await loadChunk(0, 1, INITIAL_PRELOAD - 1);
+
+      // بعد ذلك حمّل فريم واحد warm-up من المشاهد التالية
+      loadFrame(1, 0);
+      loadFrame(2, 0);
+    })();
+
+    // Resize Listener
+    const handleResize = () => {
+      resizeCanvas();
+      ScrollTrigger.refresh();
+    };
+    window.addEventListener("resize", handleResize);
+    window.addEventListener("orientationchange", handleResize);
+
+    return () => {
+      mounted = false;
+      window.removeEventListener("resize", handleResize);
+      window.removeEventListener("orientationchange", handleResize);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /* ═════════════════════════════════════════════════════════════
+     8) إعداد GSAP + ScrollTrigger (يعمل فقط بعد ظهور الفريم الأول)
+     ═════════════════════════════════════════════════════════════ */
   useLayoutEffect(() => {
+    if (!firstFrameReady) return;
     const root = rootRef.current;
     if (!root) return;
 
-    const videos = Array.from(root.querySelectorAll<HTMLVideoElement>("[data-video]"));
-
-    // تهيئة الفيديوهات وتجميدها لتتحكمي بها يدوياً بالسكرول
-    videos.forEach((v) => {
-      v.muted = true;
-      v.pause();
-      if (v.readyState >= 1) {
-        v.currentTime = 0.001;
-      } else {
-        v.addEventListener("loadedmetadata", () => {
-          v.currentTime = 0.001;
-        }, { once: true });
-      }
-    });
-
-    // دالة Seek سريعة وفائقة الأداء
-    const seekVideoFast = (v: HTMLVideoElement, targetTime: number) => {
-      if (!v || !v.duration || v.seeking) return;
-      if ("fastSeek" in v && typeof (v as any).fastSeek === "function") {
-        (v as any).fastSeek(targetTime);
-      } else {
-        v.currentTime = targetTime;
-      }
-    };
+    // Reduced Motion: لا animation، فقط اعرض أول فريم
+    if (reduced) {
+      loadFrame(0, 0).then((img) => img && drawFrame(img));
+      return;
+    }
 
     const ctx = gsap.context(() => {
-      const layers = gsap.utils.toArray<HTMLElement>("[data-scene]");
       const captions = gsap.utils.toArray<HTMLElement>("[data-caption]");
       const markers = gsap.utils.toArray<HTMLElement>("[data-marker]");
 
-      /* ————— أنيميشن ترحيبي عند فتح الصفحة لأول مرة ————— */
-      if (!reduced) {
-        const intro = gsap.timeline({ delay: 0.1, defaults: { ease: "power4.out" } });
-        intro
-          .fromTo(".js-title-line", { yPercent: 110 }, { yPercent: 0, duration: 1.2, stagger: 0.08 }, 0.1)
-          .fromTo(".js-title-sub", { opacity: 0, y: 12 }, { opacity: 1, y: 0, duration: 0.8 }, 0.6)
-          .fromTo(".js-hero-ui", { opacity: 0 }, { opacity: 1, duration: 0.8, stagger: 0.05 }, 0.7);
-      }
+      /* ─── Intro Animation ─── */
+      const intro = gsap.timeline({ delay: 0.1, defaults: { ease: "power4.out" } });
+      intro
+        .fromTo(".js-title-line", { yPercent: 110 }, { yPercent: 0, duration: 1.2, stagger: 0.08 }, 0.1)
+        .fromTo(".js-title-sub", { opacity: 0, y: 12 }, { opacity: 1, y: 0, duration: 0.8 }, 0.6)
+        .fromTo(".js-hero-ui", { opacity: 0 }, { opacity: 1, duration: 0.8, stagger: 0.05 }, 0.7);
 
-      /* ————— الخط الزمني المرتبط بالسكرول ————— */
+      /* ─── متغير التقدم الرئيسي (0 → 3) ─── */
+      const progress = { value: 0 };
+
+      /* ─── دالة الرسم مع Preloading الذكي ─── */
+      let lastRenderedSceneIdx = -1;
+      const updateFromProgress = () => {
+        const p = progress.value; // 0 to 3
+
+        // تحديد المشهد الحالي والفريم داخله
+        let sceneIdx = Math.floor(p);
+        let localProgress = p - sceneIdx;
+
+        if (sceneIdx >= SCENES.length) {
+          sceneIdx = SCENES.length - 1;
+          localProgress = 1;
+        }
+
+        const frameIdx = Math.min(
+          FRAME_COUNT - 1,
+          Math.floor(localProgress * FRAME_COUNT)
+        );
+
+        currentStateRef.current.sceneIndex = sceneIdx;
+        currentStateRef.current.frameIndex = frameIdx;
+
+        renderCurrentFrame();
+
+        /* Progressive Loading ذكي:
+           عند دخول مشهد جديد → حمّل أول chunk فوراً
+           عند اقتراب النهاية → حمّل chunks المشهد التالي مسبقاً */
+        if (sceneIdx !== lastRenderedSceneIdx) {
+          lastRenderedSceneIdx = sceneIdx;
+          loadChunk(sceneIdx, 0, INITIAL_PRELOAD);
+          // تنظيف الذاكرة عند تغيير المشهد
+          pruneMemory(sceneIdx, frameIdx);
+        }
+
+        // Preload chunk الجاي داخل نفس المشهد
+        const nextChunkStart = Math.floor(frameIdx / CHUNK_SIZE) * CHUNK_SIZE + CHUNK_SIZE;
+        if (nextChunkStart < FRAME_COUNT) {
+          const cache = cacheRef.current[sceneIdx];
+          if (!cache.loaded[nextChunkStart] && !cache.loading[nextChunkStart]) {
+            loadChunk(sceneIdx, nextChunkStart, CHUNK_SIZE);
+          }
+        }
+
+        // Preload المشهد التالي إذا اقتربنا من نهاية الحالي
+        if (localProgress > 0.75 && sceneIdx < SCENES.length - 1) {
+          const nextScene = sceneIdx + 1;
+          const nextCache = cacheRef.current[nextScene];
+          if (!nextCache.loaded[0]) {
+            loadChunk(nextScene, 0, INITIAL_PRELOAD);
+          }
+        }
+      };
+
+      /* ─── GSAP Ticker: يرسم فقط عندما يتغير التقدم فعلياً ─── */
+      let lastProgressValue = -1;
+      const tickerFn = () => {
+        if (progress.value !== lastProgressValue) {
+          lastProgressValue = progress.value;
+          updateFromProgress();
+        }
+      };
+      gsap.ticker.add(tickerFn);
+
+      /* ─── الـ Timeline الرئيسي المرتبط بالسكرول ─── */
       const tl = gsap.timeline({
-        defaults: { ease: "none" },
         scrollTrigger: {
           trigger: root,
           start: "top top",
           end: "bottom bottom",
-          scrub: 0.15, // استجابة فورية وحسية وناعمة جداً مع حركة اليد
-          onUpdate: (self) => {
-            const p = self.progress;
-
-            // تحديث فريمات الفيديوهات بدقة وسلاسة متناهية
-            if (p < 0.35) {
-              const v0 = videos[0];
-              if (v0?.duration) seekVideoFast(v0, (p / 0.35) * (v0.duration - 0.05));
-            } else if (p >= 0.35 && p < 0.68) {
-              const v1 = videos[1];
-              if (v1?.duration) seekVideoFast(v1, ((p - 0.35) / 0.33) * (v1.duration - 0.05));
-            } else {
-              const v2 = videos[2];
-              if (v2?.duration) seekVideoFast(v2, ((p - 0.68) / 0.32) * (v2.duration - 0.05));
-            }
-
-            // تفعيل وإخفاء الفيديوهات ذكياً لمنع ثقل الكارت والذاكرة
-            layers[0].style.visibility = p <= 0.45 ? "visible" : "hidden";
-            layers[1].style.visibility = (p >= 0.25 && p <= 0.78) ? "visible" : "hidden";
-            layers[2].style.visibility = p >= 0.58 ? "visible" : "hidden";
-          },
+          scrub: 0.6,          // scrub ناعم ومريح
+          invalidateOnRefresh: true,
         },
       });
 
-      // ضبط الحالات الأولية للطبقات والـ Z-Index
-      gsap.set(layers[0], { opacity: 1, scale: 1, zIndex: 10 });
-      gsap.set(layers[1], { opacity: 0, scale: 1.05, zIndex: 20 }); // يبدأ مكبراً قليلاً لينعم مع الانتقال
-      gsap.set(layers[2], { opacity: 0, scale: 1.05, zIndex: 30 }); // يبدأ مكبراً قليلاً لينعم مع الانتقال
+      // تحريك متغير التقدم من 0 إلى 3 (يمثل 3 مشاهد)
+      tl.to(progress, { value: 3, ease: "none", duration: 3 }, 0);
 
-      /* ═════════ الانتقالات السينمائية الخارقة (Hollywood Match-Move) ═════════ */
-      
-      // الانتقال الأول: من المشهد 01 إلى المشهد 02 (يبدأ التداخل عند progress 0.6 ويستمر حتى 0.95)
-      // تمدد خفيف للمشهد الأول كأننا نعبر من خلاله
-      tl.to(layers[0], { scale: 1.04, duration: 0.8 }, 0);
-      tl.to(layers[0], { opacity: 0, duration: 0.35, ease: "power2.inOut" }, 0.6);
-      
-      // ظهور المشهد الثاني من العمق مع عودته لحجمه الطبيعي 100% بنعومة بالغة
-      tl.to(layers[1], { opacity: 1, duration: 0.38, ease: "power2.inOut" }, 0.58);
-      tl.to(layers[1], { scale: 1, duration: 0.42, ease: "power1.out" }, 0.58);
-
-      // الانتقال الثاني: من المشهد 02 إلى المشهد 03
-      // تمدد خفيف للمشهد الثاني
-      tl.to(layers[1], { scale: 1.04, duration: 0.8 }, 1.0);
-      tl.to(layers[1], { opacity: 0, duration: 0.35, ease: "power2.inOut" }, 1.6);
-      
-      // ظهور المشهد الثالث بنعومة بالغة
-      tl.to(layers[2], { opacity: 1, duration: 0.38, ease: "power2.inOut" }, 1.58);
-      tl.to(layers[2], { scale: 1, duration: 0.42, ease: "power1.out" }, 1.58);
-
-      /* ═════════ حركة النصوص والـ UI ═════════ */
+      /* ─── حركة النصوص والـ UI (بالتزامن مع التقدم) ─── */
       tl.to(".js-title", { opacity: 0, y: -50, scale: 0.98, duration: 0.3, ease: "power2.in" }, 0.15);
       tl.to(".js-hero-cta", { opacity: 0, duration: 0.2 }, 0.15);
       tl.to(".js-scroll-cue", { opacity: 0, duration: 0.1 }, 0.05);
 
+      /* ─── نصوص المشاهد ─── */
       captions.forEach((cap, i) => {
-        const enter = [0.22, 0.95, 1.95][i];
-        const exit = [0.65, 1.65, 99][i];
+        const enter = [0.25, 1.15, 2.15][i];
+        const exit = [0.85, 1.85, 2.9][i];
 
         tl.fromTo(
           cap,
           { opacity: 0, y: 25 },
-          { opacity: 1, y: 0, duration: 0.15, ease: "power2.out" },
+          { opacity: 1, y: 0, duration: 0.2, ease: "power2.out" },
           enter
         );
-        if (exit < 90) {
-          tl.to(cap, { opacity: 0, y: -18, duration: 0.12, ease: "power2.in" }, exit);
+        if (i < 2) {
+          tl.to(cap, { opacity: 0, y: -18, duration: 0.15, ease: "power2.in" }, exit);
         }
       });
 
-      // مؤشر التقدم الجانبي الفخم
-      tl.fromTo(".js-rail-fill", { scaleY: 0 }, { scaleY: 1, duration: 2.65 }, 0);
+      /* ─── مؤشر التقدم الجانبي ─── */
+      tl.fromTo(".js-rail-fill", { scaleY: 0 }, { scaleY: 1, duration: 3, ease: "none" }, 0);
       markers.forEach((m, i) => {
-        tl.to(m, { opacity: 1, color: "#c2a264", duration: 0.01 }, [0, 0.95, 1.95][i]);
+        tl.to(m, { opacity: 1, color: "#c2a264", duration: 0.01 }, [0.05, 1.05, 2.05][i]);
       });
 
-      // أنيميشن ختام البطل قبل دخول محتوى الصفحة التالي
-      tl.fromTo(".js-endnote", { opacity: 0, y: 15 }, { opacity: 1, y: 0, duration: 0.15, ease: "power2.out" }, 2.4);
-      tl.to(".js-endnote", { opacity: 0, duration: 0.08 }, 2.65);
-      tl.to([".js-rail", ".js-caption-stack"], { opacity: 0, duration: 0.1 }, 2.55);
+      /* ─── تأثير Scale خفيف على الكانفاس عند الانتقال (Cinematic feel) ─── */
+      tl.fromTo(
+        canvasRef.current,
+        { scale: 1 },
+        { scale: 1.02, duration: 1, ease: "sine.inOut", yoyo: true, repeat: 2 },
+        0
+      );
 
-      ScrollTrigger.refresh();
+      /* ─── رسالة النهاية ─── */
+      tl.fromTo(".js-endnote", { opacity: 0, y: 15 }, { opacity: 1, y: 0, duration: 0.2 }, 2.75);
+      tl.to(".js-endnote", { opacity: 0, duration: 0.15 }, 2.95);
+      tl.to([".js-rail", ".js-caption-stack"], { opacity: 0, duration: 0.15 }, 2.9);
+
+      /* ─── Cleanup ─── */
+      return () => {
+        gsap.ticker.remove(tickerFn);
+      };
     }, root);
+
+    ScrollTrigger.refresh();
 
     return () => {
       ctx.revert();
     };
-  }, [reduced]);
+  }, [firstFrameReady, reduced]);
 
+  /* ═════════════════════════════════════════════════════════════
+     العرض
+     ═════════════════════════════════════════════════════════════ */
   return (
     <section
       id="project"
       ref={rootRef}
-      aria-label="VÉRA — a clean cinematic journey"
-      className="relative h-[400vh] bg-transparent md:h-[450vh]"
+      aria-label="VÉRA — a cinematic journey"
+      // ارتفاع طويل = وقت scroll كافٍ لرؤية تفاصيل كل مشهد
+      className="relative h-[500vh] bg-[#0a0a0a] md:h-[600vh]"
     >
-      <div className="sticky top-0 h-[100svh] w-full overflow-hidden bg-transparent">
-        {/* — الفيديوهات المسرّعة مع ميزة التمدد العميق — */}
-        <div className="absolute inset-0 [transform:translateZ(0)]">
-          {SCENES.map((scene, i) => (
-            <CinematicScene key={scene.id} scene={scene} priority={i === 0} />
-          ))}
-        </div>
+      <div className="sticky top-0 h-[100svh] w-full overflow-hidden bg-[#0a0a0a]">
+        {/* ═══════ الكانفاس الوحيد (بديل كل الفيديوهات) ═══════ */}
+        <canvas
+          ref={canvasRef}
+          aria-hidden="true"
+          className="absolute inset-0 h-full w-full object-cover pointer-events-none select-none [transform:translateZ(0)] will-change-transform"
+          style={{
+            aspectRatio: `${CANVAS_ASPECT}`,
+            width: "100%",
+            height: "100%",
+          }}
+        />
 
-        {/* — العنوان الرئيسي — */}
+        {/* Poster: أول فريم كصورة احتياطية قبل تهيئة الكانفاس (يمنع black flash) */}
+        {!firstFrameReady && (
+          <img
+            src={getFramePath(SCENES[0].folder, 1)}
+            alt=""
+            aria-hidden="true"
+            className="absolute inset-0 h-full w-full object-cover pointer-events-none"
+          />
+        )}
+
+        {/* ═══════ العنوان الرئيسي ═══════ */}
         <div className="js-title pointer-events-none absolute inset-0 flex flex-col items-center justify-center px-6 text-center z-40">
           <h1 className="font-display text-ivory uppercase">
             <span className="block overflow-hidden pb-1">
@@ -185,7 +463,7 @@ export default function CinematicHero() {
           </div>
         </div>
 
-        {/* — نصوص المشاهد أسفل اليسار — */}
+        {/* ═══════ نصوص المشاهد ═══════ */}
         <div className="js-caption-stack js-hero-ui pointer-events-none absolute bottom-24 left-6 h-40 w-[26rem] max-w-[calc(100vw-3rem)] md:bottom-16 md:left-12 z-40">
           {SCENES.map((scene) => (
             <div key={scene.id} data-caption className="absolute bottom-0 left-0 opacity-0">
@@ -204,7 +482,7 @@ export default function CinematicHero() {
           ))}
         </div>
 
-        {/* — مؤشر التقدم على اليمين — */}
+        {/* ═══════ مؤشر التقدم الجانبي ═══════ */}
         <div className="js-rail js-hero-ui pointer-events-none absolute top-1/2 right-5 hidden -translate-y-1/2 flex-col items-center gap-7 md:right-10 md:flex z-40">
           <span className="eyebrow text-[0.5625rem] text-ivory/45 [writing-mode:vertical-rl]">
             THE JOURNEY
@@ -225,7 +503,7 @@ export default function CinematicHero() {
           </div>
         </div>
 
-        {/* — مؤشر السكرول — */}
+        {/* ═══════ Scroll Cue ═══════ */}
         <div className="js-scroll-cue js-hero-ui pointer-events-none absolute bottom-8 left-1/2 hidden -translate-x-1/2 flex-col items-center gap-3 md:bottom-10 md:flex z-40">
           <span className="eyebrow text-ivory/55">Scroll</span>
           <span className="relative h-9 w-px overflow-hidden bg-ivory/15">
@@ -233,13 +511,13 @@ export default function CinematicHero() {
           </span>
         </div>
 
-        {/* — رسالة النهاية — */}
+        {/* ═══════ رسالة النهاية ═══════ */}
         <div className="js-endnote pointer-events-none absolute inset-x-0 bottom-12 flex flex-col items-center gap-4 opacity-0 z-40">
           <p className="eyebrow text-champagne">The VÉRA world continues below</p>
           <ArrowDown className="h-4 w-4 text-ivory/60" strokeWidth={1.25} />
         </div>
 
-        {/* — زر استكشاف — */}
+        {/* ═══════ زر الاستكشاف ═══════ */}
         <div className="js-hero-cta js-hero-ui absolute right-6 bottom-7 md:right-12 md:bottom-16 z-40">
           <ArrowLink
             label="EXPLORE VÉRA"
