@@ -1,12 +1,20 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useCinematicReveals } from "../hooks/useCinematicReveals";
-import { scrollToTarget } from "../lib/scroll";
+import { scrollToTarget, prefersReducedMotion } from "../lib/scroll";
 import { CONTACT } from "../data/content";
-import { SCENES } from "../data/scenes";
-
-/** The closing frame re-uses the interior footage (already cached). */
-const SCENE_VIDEO_REUSE = SCENES[2].src;
+import { SCENES, FRAME_COUNT, getFramePath } from "../data/scenes";
 import ArrowLink from "./ui/ArrowLink";
+
+/* ═══════════════════════════════════════════════════════════════
+   الأنيميشن هنا "loop" تلقائي (مش scroll-scrubbing زي الهيرو)
+   لأن السكشن ده مش طويل بما يكفي لمساحة سكرول منفصلة.
+   بيستخدم نفس بيانات الفريمات بتاعة scene-3.
+   ═══════════════════════════════════════════════════════════════ */
+const CLOSING_SCENE = SCENES[2] ?? SCENES[0];
+const DPR_CAP = 1.75;
+const INITIAL_PRELOAD = 30;
+const CHUNK_SIZE = 20;
+const PLAYBACK_FPS = 24; // سرعة اللوب
 
 /**
  * 05 — CONTACT / CLOSING
@@ -15,27 +23,182 @@ import ArrowLink from "./ui/ArrowLink";
  */
 export default function FinalCTA() {
   const ref = useRef<HTMLElement>(null);
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [firstFrameReady, setFirstFrameReady] = useState(false);
   useCinematicReveals(ref);
 
-  /* Play only while on screen — the file is already cached from the hero. */
+  const reduced = prefersReducedMotion();
+
+  const cacheRef = useRef({
+    images: new Array<HTMLImageElement | null>(FRAME_COUNT).fill(null),
+    loaded: new Array<boolean>(FRAME_COUNT).fill(false),
+    loading: new Array<boolean>(FRAME_COUNT).fill(false),
+  });
+
+  const stateRef = useRef({ frameIndex: 0, lastDrawn: -1 });
+  const rafRef = useRef<number | null>(null);
+  const lastTickRef = useRef(0);
+
+  /* — تحميل فريم واحد — */
+  const loadFrame = (frameIdx: number): Promise<HTMLImageElement | null> => {
+    return new Promise((resolve) => {
+      const cache = cacheRef.current;
+      if (cache.loaded[frameIdx] || cache.loading[frameIdx]) {
+        resolve(cache.images[frameIdx]);
+        return;
+      }
+      cache.loading[frameIdx] = true;
+      const img = new Image();
+      img.decoding = "async";
+      img.src = getFramePath(CLOSING_SCENE.folder, frameIdx + 1);
+      img.onload = () => {
+        cache.images[frameIdx] = img;
+        cache.loaded[frameIdx] = true;
+        cache.loading[frameIdx] = false;
+        resolve(img);
+      };
+      img.onerror = () => {
+        cache.loading[frameIdx] = false;
+        // eslint-disable-next-line no-console
+        console.warn(`[FinalCTA] Failed to load frame: ${img.src}`);
+        resolve(null);
+      };
+    });
+  };
+
+  const loadChunk = async (start: number, size: number) => {
+    const end = Math.min(start + size, FRAME_COUNT);
+    const promises: Promise<HTMLImageElement | null>[] = [];
+    for (let i = start; i < end; i++) promises.push(loadFrame(i));
+    await Promise.all(promises);
+  };
+
+  /* — رسم فريم على الكانفاس بنظام cover — */
+  const drawFrame = (img: HTMLImageElement) => {
+    const canvas = canvasRef.current;
+    if (!canvas || !img.complete || img.naturalWidth === 0) return;
+    const ctx = canvas.getContext("2d", { alpha: false });
+    if (!ctx) return;
+
+    const cw = canvas.width;
+    const ch = canvas.height;
+    const iw = img.naturalWidth;
+    const ih = img.naturalHeight;
+    const scale = Math.max(cw / iw, ch / ih);
+    const dw = iw * scale;
+    const dh = ih * scale;
+    const dx = (cw - dw) / 2;
+    const dy = (ch - dh) / 2;
+    ctx.drawImage(img, dx, dy, dw, dh);
+  };
+
+  const renderCurrentFrame = () => {
+    const state = stateRef.current;
+    if (state.lastDrawn === state.frameIndex) return;
+    const cache = cacheRef.current;
+    const img = cache.images[state.frameIndex];
+    if (img && cache.loaded[state.frameIndex]) {
+      drawFrame(img);
+      state.lastDrawn = state.frameIndex;
+    }
+  };
+
+  const resizeCanvas = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const dpr = Math.min(window.devicePixelRatio || 1, DPR_CAP);
+    const rect = canvas.getBoundingClientRect();
+    const width = Math.round(rect.width * dpr);
+    const height = Math.round(rect.height * dpr);
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+      stateRef.current.lastDrawn = -1;
+      renderCurrentFrame();
+    }
+  };
+
+  /* — تحميل مبدئي: أول فريم فورًا، ثم الباقي تدريجيًا — */
   useEffect(() => {
-    const video = videoRef.current;
+    let mounted = true;
+    (async () => {
+      const firstImg = await loadFrame(0);
+      if (!mounted) return;
+      resizeCanvas();
+      if (firstImg) {
+        drawFrame(firstImg);
+        stateRef.current.lastDrawn = 0;
+      }
+      setFirstFrameReady(true);
+      await loadChunk(1, INITIAL_PRELOAD - 1);
+      // تحميل الباقي في الخلفية على دفعات
+      for (let start = INITIAL_PRELOAD; start < FRAME_COUNT; start += CHUNK_SIZE) {
+        if (!mounted) return;
+        await loadChunk(start, CHUNK_SIZE);
+      }
+    })();
+
+    const handleResize = () => resizeCanvas();
+    window.addEventListener("resize", handleResize);
+    window.addEventListener("orientationchange", handleResize);
+    return () => {
+      mounted = false;
+      window.removeEventListener("resize", handleResize);
+      window.removeEventListener("orientationchange", handleResize);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /* — تشغيل/إيقاف اللوب حسب ظهور السكشن على الشاشة — */
+  useEffect(() => {
+    if (!firstFrameReady) return;
     const el = ref.current;
-    if (!video || !el) return;
+    if (!el) return;
+
+    if (reduced) {
+      // Reduced motion: اعرض أول فريم بس، من غير لوب
+      return;
+    }
+
+    const frameDuration = 1000 / PLAYBACK_FPS;
+
+    const tick = (time: number) => {
+      if (time - lastTickRef.current >= frameDuration) {
+        lastTickRef.current = time;
+        const state = stateRef.current;
+        state.frameIndex = (state.frameIndex + 1) % FRAME_COUNT;
+        renderCurrentFrame();
+      }
+      rafRef.current = requestAnimationFrame(tick);
+    };
+
+    const startLoop = () => {
+      if (rafRef.current == null) {
+        lastTickRef.current = 0;
+        rafRef.current = requestAnimationFrame(tick);
+      }
+    };
+    const stopLoop = () => {
+      if (rafRef.current != null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+    };
+
     const io = new IntersectionObserver(
       ([entry]) => {
-        if (entry.isIntersecting) {
-          video.play()?.catch(() => {});
-        } else {
-          video.pause();
-        }
+        if (entry.isIntersecting) startLoop();
+        else stopLoop();
       },
       { threshold: 0.15 },
     );
     io.observe(el);
-    return () => io.disconnect();
-  }, []);
+
+    return () => {
+      io.disconnect();
+      stopLoop();
+    };
+  }, [firstFrameReady, reduced]);
 
   return (
     <section
@@ -45,25 +208,21 @@ export default function FinalCTA() {
     >
       {/* — returning footage, heavily veiled — */}
       <div className="absolute inset-0">
-        <img
-          src="/videos/vera-poster-03.jpg"
-          alt=""
-          aria-hidden
-          className="absolute inset-0 h-full w-full object-cover"
-          loading="lazy"
-          decoding="async"
+        <canvas
+          ref={canvasRef}
+          aria-hidden="true"
+          className="absolute inset-0 h-full w-full object-cover pointer-events-none select-none [transform:translateZ(0)] will-change-transform"
         />
-        <video
-          ref={videoRef}
-          className="absolute inset-0 h-full w-full object-cover"
-          src={SCENE_VIDEO_REUSE}
-          preload="none"
-          muted
-          playsInline
-          loop
-          aria-hidden
-          tabIndex={-1}
-        />
+        {!firstFrameReady && (
+          <img
+            src={getFramePath(CLOSING_SCENE.folder, 1)}
+            alt=""
+            aria-hidden
+            className="absolute inset-0 h-full w-full object-cover"
+            loading="lazy"
+            decoding="async"
+          />
+        )}
         <div className="absolute inset-0 bg-ink/72" />
         <div className="vignette-soft absolute inset-0" />
       </div>
