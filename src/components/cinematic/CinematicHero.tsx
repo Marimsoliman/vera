@@ -6,18 +6,13 @@ import { prefersReducedMotion, scrollToTarget } from "../../lib/scroll";
 import { SCENES, FRAME_COUNT, getFramePath } from "../../data/scenes";
 import ArrowLink from "../ui/ArrowLink";
 
-const DPR_CAP = 1.25; // تحسين دقة الأداء لضمان سلاسة الحركة على الموبايل والشاشات الضعيفة
+const DPR_CAP = 1.25;
 
-interface SceneCache {
-  images: Map<number, HTMLImageElement>;
-  loading: Set<number>;
-}
-
-// طابور تحميل ذكي ومحدد لمنع اختناق الشبكة (Max 3 concurrent requests)
+// طابور تحميل ذكي - 6 طلبات متزامنة بدلاً من 3 لزيادة سرعة التحميل الأولي بشكل كبير
 class TaskQueue {
   private activeCount = 0;
   private queue: (() => Promise<void>)[] = [];
-  constructor(private maxConcurrency = 3) {}
+  constructor(private maxConcurrency = 6) {}
 
   add(task: () => Promise<void>) {
     this.queue.push(task);
@@ -35,17 +30,21 @@ class TaskQueue {
   }
 }
 
-const downloadQueue = new TaskQueue(3);
+const downloadQueue = new TaskQueue(6);
+
+interface SceneCache {
+  images: Map<number, HTMLImageElement>;
+  loading: Set<number>;
+}
 
 export default function CinematicHero() {
   const rootRef = useRef<HTMLElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const posterRef = useRef<HTMLImageElement>(null); // Ref مباشر للبوستر لمنع Re-render
+  const posterRef = useRef<HTMLImageElement>(null);
 
   const [isInitialized, setIsInitialized] = useState(false);
   const reduced = prefersReducedMotion();
 
-  // كاش فريمات الصور
   const cacheRef = useRef<SceneCache[]>(
     SCENES.map(() => ({
       images: new Map(),
@@ -62,7 +61,7 @@ export default function CinematicHero() {
   });
 
   /* ═════════════════════════════════════════════════════════════
-     1) رسم الصورة على الكانفاس بأعلى أداء (Hardware Accelerated)
+     1) رسم الصورة على الكانفاس
      ═════════════════════════════════════════════════════════════ */
   const renderImageToCanvas = useCallback((img: HTMLImageElement) => {
     const canvas = canvasRef.current;
@@ -95,7 +94,6 @@ export default function CinematicHero() {
 
     ctx.drawImage(img, dx, dy, dw, dh);
 
-    // إخفاء الـ Poster فوراً وبنعومة عبر الـ DOM مباشرة وبدون Re-render
     if (!stateRef.current.canvasHasDrawn) {
       stateRef.current.canvasHasDrawn = true;
       if (posterRef.current) {
@@ -109,7 +107,7 @@ export default function CinematicHero() {
   }, []);
 
   /* ═════════════════════════════════════════════════════════════
-     2) تحميل فريم ذكي متحكم به عبر الطابور (Controlled Queue)
+     2) تحميل فريم واحد
      ═════════════════════════════════════════════════════════════ */
   const loadSingleFrame = useCallback(
     (sceneIdx: number, frameIdx: number): Promise<HTMLImageElement | null> => {
@@ -132,7 +130,6 @@ export default function CinematicHero() {
 
         cache.loading.add(frameIdx);
 
-        // إضافة عملية التحميل للطابور لمنع زيادة الضغط على المتصفح
         downloadQueue.add(async () => {
           try {
             const img = new Image();
@@ -158,12 +155,11 @@ export default function CinematicHero() {
   );
 
   /* ═════════════════════════════════════════════════════════════
-     3) تحميل الفريمات المحيطة بالطلب فقط (Strict Surrounding Preload)
+     3) تحميل الفريمات المحيطة
      ═════════════════════════════════════════════════════════════ */
   const preloadSurrounding = useCallback(
     (sceneIdx: number, frameIdx: number) => {
-      // تحميل إطارين للأمام وإطار للخلف فقط لتقليل التحميل غير الضروري
-      const forwardWindow = 4;
+      const forwardWindow = 3;
       const backwardWindow = 2;
 
       for (let i = 1; i <= forwardWindow; i++) {
@@ -172,9 +168,8 @@ export default function CinematicHero() {
       for (let i = 1; i <= backwardWindow; i++) {
         if (frameIdx - i >= 0) loadSingleFrame(sceneIdx, frameIdx - i);
       }
-      
-      // التجهيز الذكي للمشهد التالي
-      if (frameIdx > FRAME_COUNT - 8 && sceneIdx + 1 < SCENES.length) {
+
+      if (frameIdx > FRAME_COUNT - 7 && sceneIdx + 1 < SCENES.length) {
         loadSingleFrame(sceneIdx + 1, 0);
         loadSingleFrame(sceneIdx + 1, 1);
       }
@@ -183,7 +178,7 @@ export default function CinematicHero() {
   );
 
   /* ═════════════════════════════════════════════════════════════
-     4) رندر الفريم مع معالجة الحركة السريعة
+     4) رندر الفريم
      ═════════════════════════════════════════════════════════════ */
   const renderFrame = useCallback(
     (sceneIdx: number, frameIdx: number) => {
@@ -198,24 +193,19 @@ export default function CinematicHero() {
         stateRef.current.lastDrawnScene = sceneIdx;
         stateRef.current.lastDrawnFrame = frameIdx;
       } else {
-        // البحث عن أقرب فريم جاهز لعدم حدوث أي رمش أسود
-        let fallbackFound = false;
         for (let offset = 1; offset <= 10; offset++) {
           const prev = cache.images.get(frameIdx - offset);
           const next = cache.images.get(frameIdx + offset);
           if (prev) {
             renderImageToCanvas(prev);
-            fallbackFound = true;
             break;
           }
           if (next) {
             renderImageToCanvas(next);
-            fallbackFound = true;
             break;
           }
         }
 
-        // تحميل الفريم الأصلي المطلوب وعرضه فور وصوله
         loadSingleFrame(sceneIdx, frameIdx).then((img) => {
           if (
             img &&
@@ -235,7 +225,7 @@ export default function CinematicHero() {
   );
 
   /* ═════════════════════════════════════════════════════════════
-     5) ريسيز الكانفاس لتطابق دقة الشاشة
+     5) ريسيز الكانفاس
      ═════════════════════════════════════════════════════════════ */
   const resizeCanvas = useCallback(() => {
     const canvas = canvasRef.current;
@@ -260,13 +250,12 @@ export default function CinematicHero() {
   }, [renderImageToCanvas]);
 
   /* ═════════════════════════════════════════════════════════════
-     6) التهيئة المبدئية الخفيفة
+     6) التهيئة المبدئية - تحميل ALL الفريمات عند فتح الموقع
      ═════════════════════════════════════════════════════════════ */
   useEffect(() => {
     let active = true;
 
     (async () => {
-      // تحميل فريم البداية رقم 0 بأعلى أولوية
       const first = await loadSingleFrame(0, 0);
       if (!active) return;
 
@@ -274,17 +263,26 @@ export default function CinematicHero() {
       if (first) {
         renderImageToCanvas(first);
       }
-      setIsInitialized(true);
 
-      // تحميل فريمات البداية للمشاهد الأخرى كعلامات توقف سريعة
-      for (let s = 1; s < SCENES.length; s++) {
-        loadSingleFrame(s, 0);
+      const criticalPromises: Promise<HTMLImageElement | null>[] = [];
+
+      for (let s = 0; s < SCENES.length; s++) {
+        criticalPromises.push(loadSingleFrame(s, 0));
       }
 
-      // تحميل أول 8 إطارات فقط لسرعة تشغيل الصفحة المبدئية
-      for (let f = 1; f < 8; f++) {
-        if (!active) break;
-        await loadSingleFrame(0, f);
+      for (let f = 1; f < 15; f++) {
+        criticalPromises.push(loadSingleFrame(0, f));
+      }
+
+      await Promise.allSettled(criticalPromises);
+      if (!active) return;
+
+      setIsInitialized(true);
+
+      for (let s = 0; s < SCENES.length; s++) {
+        for (let f = 0; f < FRAME_COUNT; f++) {
+          loadSingleFrame(s, f);
+        }
       }
     })();
 
@@ -304,7 +302,7 @@ export default function CinematicHero() {
   }, [loadSingleFrame, renderImageToCanvas, resizeCanvas]);
 
   /* ═════════════════════════════════════════════════════════════
-     7) محرك الحركة GSAP + ScrollTrigger
+     7) GSAP ScrollTrigger
      ═════════════════════════════════════════════════════════════ */
   useLayoutEffect(() => {
     if (!isInitialized) return;
@@ -320,7 +318,6 @@ export default function CinematicHero() {
       const captions = gsap.utils.toArray<HTMLElement>("[data-caption]");
       const markers = gsap.utils.toArray<HTMLElement>("[data-marker]");
 
-      // أنيميشن النصوص في البداية
       const intro = gsap.timeline({ delay: 0.1, defaults: { ease: "power4.out" } });
       intro
         .fromTo(".js-title-line", { yPercent: 110 }, { yPercent: 0, duration: 1.2, stagger: 0.08 }, 0.1)
@@ -329,7 +326,6 @@ export default function CinematicHero() {
 
       const progressObj = { value: 0 };
 
-      // دالة الرسم المربوطة بـ Ticker التابع لـ GSAP لمنع الـ Layout Thrashing
       let lastVal = -1;
       const onTick = () => {
         if (progressObj.value === lastVal) return;
@@ -354,16 +350,14 @@ export default function CinematicHero() {
 
       gsap.ticker.add(onTick);
 
-      // التايملاين المرتبط بالـ Scroll
       const tl = gsap.timeline({
         scrollTrigger: {
           trigger: root,
           start: "top top",
           end: "bottom bottom",
-          scrub: 0.3, // سلاسة مطلقة وسرعة استجابة مذهلة
+          scrub: 0.3,
           invalidateOnRefresh: true,
           onUpdate: (self) => {
-            // تحديث قيمة التقدم التي يراقبها الـ Ticker
             progressObj.value = self.progress * SCENES.length;
           },
         },
@@ -412,8 +406,6 @@ export default function CinematicHero() {
       className="relative h-[450vh] bg-[#0a0a0a] md:h-[550vh]"
     >
       <div className="sticky top-0 h-[100svh] w-full overflow-hidden bg-[#0a0a0a]">
-        
-        {/* 1. صورة Poster فورية - مخفية عبر CSS الترانزيشن بمجرد أن يرسم الكانفاس أول فريم بنجاح */}
         <img
           ref={posterRef}
           src={getFramePath(SCENES[0].folder, 1)}
@@ -425,14 +417,12 @@ export default function CinematicHero() {
           className="absolute inset-0 h-full w-full object-cover pointer-events-none transition-opacity duration-300 ease-out z-10 opacity-100"
         />
 
-        {/* 2. الكانفاس الرئيسي - يبدأ بـ opacity-0 لضمان عدم ظهور أي شاشة سوداء إطلاقاً ثم يظهر بلحظة سحرية */}
         <canvas
           ref={canvasRef}
           aria-hidden="true"
           className="absolute inset-0 block h-full w-full pointer-events-none select-none z-20 transition-opacity duration-300 opacity-0"
         />
 
-        {/* النصوص والعناصر المرئية الزخرفية */}
         <div className="js-title pointer-events-none absolute inset-0 flex flex-col items-center justify-center px-6 text-center z-40">
           <h1 className="font-display text-ivory uppercase">
             <span className="block overflow-hidden pb-1">
@@ -453,7 +443,6 @@ export default function CinematicHero() {
           </div>
         </div>
 
-        {/* نصوص المشاهد المتغيرة */}
         <div className="js-caption-stack js-hero-ui pointer-events-none absolute bottom-24 left-6 h-40 w-[26rem] max-w-[calc(100vw-3rem)] md:bottom-16 md:left-12 z-40">
           {SCENES.map((scene) => (
             <div key={scene.id} data-caption className="absolute bottom-0 left-0 opacity-0">
@@ -472,7 +461,6 @@ export default function CinematicHero() {
           ))}
         </div>
 
-        {/* مؤشر السكة الجانبي */}
         <div className="js-rail js-hero-ui pointer-events-none absolute top-1/2 right-5 hidden -translate-y-1/2 flex-col items-center gap-7 md:right-10 md:flex z-40">
           <span className="eyebrow text-[0.5625rem] text-ivory/45 [writing-mode:vertical-rl]">
             THE JOURNEY
@@ -493,7 +481,6 @@ export default function CinematicHero() {
           </div>
         </div>
 
-        {/* مؤشر السكرول السفلي */}
         <div className="js-scroll-cue js-hero-ui pointer-events-none absolute bottom-8 left-1/2 hidden -translate-x-1/2 flex-col items-center gap-3 md:bottom-10 md:flex z-40">
           <span className="eyebrow text-ivory/55">Scroll</span>
           <span className="relative h-9 w-px overflow-hidden bg-ivory/15">
